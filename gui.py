@@ -8,7 +8,7 @@ import streamlit as st
 from pybaseball import cache
 
 import calc
-from bet_handle import create_entry, fill_blanks, search_db
+from bet_handle import create_entry, fill_blanks, search_db, calc_payout, write_to_db
 from kalshi_handle import get_kalshi_hit_odds
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -235,6 +235,110 @@ if run_matchup_clicked:
             st.session_state["vs_right"] = vs_right
             st.session_state["vs_left"] = vs_left
 
+
+# -----------------------------
+# View / Manually Settle History
+# -----------------------------
+if view_history_clicked:
+    st.session_state["show_history"] = True
+
+if st.session_state.get("show_history"):
+    st.divider()
+    st.subheader("Unsettled Bet History")
+
+    auto_col, refresh_col = st.columns([1, 1])
+
+    with auto_col:
+        if st.button("Try Auto Fill Results"):
+            try:
+                fill_blanks()
+                st.success("Auto fill completed.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Auto fill failed: {exc}")
+
+    unsettled_rows = search_db()
+
+    if not unsettled_rows:
+        st.info("No unsettled bets.")
+    else:
+        history_df = pd.DataFrame(unsettled_rows)
+
+        st.dataframe(
+            history_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Manually Settle Result")
+
+        row_labels = [
+            f"{row['ID']} | {row['Date']} | {row['Name']} | Line: {row['Line']} | Odds: {row['Odds']} | Wager: {row['Wager']}"
+            for row in unsettled_rows
+        ]
+
+        selected_label = st.selectbox(
+            "Select bet to settle",
+            row_labels,
+            key="manual_settle_row",
+        )
+
+        selected_id = int(selected_label.split("|")[0].strip())
+
+        selected_row = next(
+            row for row in unsettled_rows
+            if int(row["ID"]) == selected_id
+        )
+
+        input_col1, input_col2 = st.columns(2)
+
+        with input_col1:
+            manual_hits = st.number_input(
+                "Hits",
+                min_value=0,
+                max_value=10,
+                step=1,
+                key="manual_hits",
+            )
+
+        with input_col2:
+            manual_abs = st.number_input(
+                "At Bats",
+                min_value=0,
+                max_value=10,
+                step=1,
+                key="manual_abs",
+            )
+
+        manual_result = f"{manual_hits}/{manual_abs}"
+
+        try:
+            line_value = float(selected_row["Line"])
+            wager_value = float(selected_row["Wager"])
+
+            if manual_hits > line_value:
+                manual_payout = round(calc_payout(selected_row["Odds"], wager_value), 2)
+            else:
+                manual_payout = 0
+
+            st.caption(
+                f"Result will be saved as **{manual_result}** with payout **{manual_payout:.2f}**"
+            )
+
+            if st.button("Save Manual Result", type="primary"):
+                write_to_db(
+                    selected_row["ID"],
+                    manual_result,
+                    manual_payout,
+                )
+
+                st.success(
+                    f"Saved result for {selected_row['Name']}: {manual_result}"
+                )
+                st.rerun()
+
+        except Exception as exc:
+            st.error(f"Could not calculate manual payout: {exc}")
 
 # Show results table if a matchup has been run
 if "matchup_df" in st.session_state:

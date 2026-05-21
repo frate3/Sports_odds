@@ -127,6 +127,7 @@ def write_to_db(id,result,payout):
     return {"status": "ok"}
 
 def get_abs(first,last,date):
+    print(first,last)
     try:
         pid = playerid_lookup(last, first)["key_mlbam"].iloc[0]
     except:
@@ -135,6 +136,7 @@ def get_abs(first,last,date):
     hit_types = ["single",'double','triple','home_run']
     hits = 0
     outs = 0
+    print(len(stats.events))
     for pitch in stats.events:
         if (pitch in hit_types):
             # print(pitch)
@@ -143,24 +145,35 @@ def get_abs(first,last,date):
             outs +=1
     return f"{hits}/{hits+outs}"
 
-def calc_payout(odds,wager):
-    odds_text = normalize_odds(odds)
-    num_odds = int(odds_text[1:])
-    wager_value = float(wager)
+def calc_payout(odds, wager):
+    odds = str(odds).strip()
+    wager = float(wager)
 
-    if odds_text[0] == "-":
-        return round(wager_value + (wager_value * 100 / num_odds), 2)
+    num_odds = int(odds[1:])
 
-    return round(wager_value + (wager_value * num_odds / 100), 2)
+    if odds[0] == "-":
+        payout = wager + (wager * 100 / num_odds)
+    else:
+        payout = wager + (wager * num_odds / 100)
+    return round(payout, 2)
+
+def get_name(name):
+    name_parts = name.split()
+    first = name_parts[0]
+    last = name_parts[-1]
+    if last.lower().replace(".", "") in ["jr", "sr", "ii", "iii", "iv"]:
+        last = name_parts[-2]
+
+    if "." in first:
+        l1, l2 = first.split(".",1)
+        first = f"{l1}. {l2}"
+    return first, last
 
 def fill_blanks():
     lines = search_db(only_open=True)
     for player in lines:
         #fetch abs
-        first, last = player['Name'].split()
-        if "." in first:
-            l1, l2 = first.split(".",1)
-            first = f"{l1}. {l2}"
+        first, last = get_name(player["Name"])
         game_ab = get_abs(first,last,player['Date'])
         if game_ab != "0/0":
             #compare to line
@@ -174,6 +187,8 @@ def fill_blanks():
             else:
                 payout = 0
             #write to file
-            write_to_db(player["ID"],game_ab,payout)
+            print(write_to_db(player["ID"],game_ab,payout))
             # return f"result: {game_ab},{payout}"
+        else:
+            print("failed to get abs")
 

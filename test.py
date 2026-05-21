@@ -1,7 +1,5 @@
-from pybaseball import playerid_lookup
+from pybaseball import statcast
 
-# print(playerid_lookup("escarra"))
-# print(playerid_lookup("escarra", "jc"))
-print(playerid_lookup("friedl", "tj"))
-print(playerid_lookup("wetherholt", "jj"))
-# print(playerid_lookup("escarra", "juan"))
+df = statcast("2026-05-20", "2026-05-20")
+soto = df[df["batter"] == 665742]
+print(soto)
