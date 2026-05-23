@@ -88,9 +88,30 @@ def normalize_hit_odds(raw_odds):
 
     return {}
 
+def get_kalshi_hit_percents(player_name):
+    """
+    Returns Kalshi implied percentages for 1+ hits and 2+ hits.
+    """
+    try:
+        kalshi_df = get_kalshi_hit_odds(player_name)
+        
+        if kalshi_df is None or kalshi_df.empty:
+            return "N/A", "N/A"
+            kalshi_df = get_kalshi_hit_odds(player_name)
+    
+        if kalshi_df is None or kalshi_df.empty:
+            print( "N/A", "N/A")
 
-##
-# add fill_blanks() function to one button to see table
+        one_hit_row = kalshi_df[1]
+        two_hit_row = kalshi_df[2]
+        
+        kalshi_1 = f"{round(american_to_probability(one_hit_row),2)*100}%"
+        kalshi_2 = f"{round(american_to_probability(two_hit_row),2)*100}%"
+
+        return kalshi_1, kalshi_2
+
+    except Exception:
+        return "N/A", "N/A"
 
 # -----------------------------
 # Streamlit UI
@@ -195,6 +216,11 @@ if run_matchup_clicked:
                         pitcher_k_ratio=pitcher_k_ratio,
                     )
 
+                    kalshi_1_hit, kalshi_2_hits = get_kalshi_hit_percents(hitter_name)
+
+                    row["Kalshi 1 hit %"] = kalshi_1_hit
+                    row["Kalshi 2 hit %"] = kalshi_2_hits
+
                     # Keep hitter ID internally so we know which row was clicked
                     row["Hitter ID"] = hitter_id
 
@@ -203,9 +229,9 @@ if run_matchup_clicked:
                         "Hitter Name": hitter_name,
                         "abs": "Error",
                         "Prob 1 hit": "Error",
-                        "1 Hit ML": "Error",
+                        "Kalshi 1 hit %": "Error",
                         "Prob 2 hits": "Error",
-                        "2 Hit ML": "Error",
+                        "Kalshi 2 hit %": "Error",
                         "Hitter ID": hitter_id,
                     }
 
@@ -220,9 +246,9 @@ if run_matchup_clicked:
                     "Hitter Name",
                     "abs",
                     "Prob 1 hit",
-                    "1 Hit ML",
+                    "Kalshi 1 hit %",
                     "Prob 2 hits",
-                    "2 Hit ML",
+                    "Kalshi 2 hit %",
                     "Hitter ID",
                 ],
             )
