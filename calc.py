@@ -5,6 +5,7 @@ from math import comb
 import requests
 import streamlit as st
 import pandas as pd
+import numpy as np
 from pybaseball import cache, statcast, statcast_batter, statcast_pitcher
 
 # --- MLB Teams ---
@@ -68,6 +69,24 @@ PITCH_CONSOLIDATION = {
 
 NON_PITCHES = ["IN", "AB", "PO"]
 
+# Additional hit-chance adjustment settings from the updated notebook logic.
+LEAGUE_AVG_SPRINT_SPEED = 27.0
+SPEED_BABIP_SCALAR = 0.0015
+SPEED_ADJ_CAP = 0.012
+H2H_CREDIBILITY_K = 50
+
+# Strike-zone grid used for the zone scalar adjustment.
+# plate_x: negative = inside to RHB, positive = outside to RHB
+ZONE_X_BINS = [-0.83, -0.28, 0.28, 0.83]
+ZONE_Z_BINS = [1.5, 2.17, 2.83, 3.5]
+
+# Raw data caches let the GUI keep the same function signatures while the
+# calculation can still use zone-level Statcast data internally.
+_LEAGUE_RAW_DF_CACHE = None
+_PITCHER_RAW_DF_CACHE = {}
+_BATTER_RAW_DF_CACHE = {}
+
+
 
 def consolidate_pitch(name):
     return PITCH_CONSOLIDATION.get(name, name)
@@ -91,8 +110,183 @@ def safe_int(value, default=0):
         return default
 
 
+def assign_zone(px, pz):
+    """Map pitch coordinates to a 3x3 strike-zone bucket, or None if unavailable."""
+    if px is None or pz is None:
+        return None
+    try:
+        if np.isnan(px) or np.isnan(pz):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    col = next((i for i in range(3) if ZONE_X_BINS[i] <= px < ZONE_X_BINS[i + 1]), None)
+    row = next((i for i in range(3) if ZONE_Z_BINS[i] <= pz < ZONE_Z_BINS[i + 1]), None)
+
+    if col is None or row is None:
+        return None
+
+    return (col, row)
+
+
+def get_pitcher_zone_profile_by_pitch(pitcher_df):
+    """Return {stand: {pitch_name: {zone: pct}}} for where a pitcher throws each pitch."""
+    result = {}
+
+    if pitcher_df is None or pitcher_df.empty:
+        return result
+
+    for stand in ["R", "L"]:
+        subset = pitcher_df[pitcher_df["stand"] == stand].copy()
+        if subset.empty:
+            result[stand] = {}
+            continue
+
+        subset["zone"] = subset.apply(lambda r: assign_zone(r.get("plate_x"), r.get("plate_z")), axis=1)
+        subset = subset[subset["zone"].notna()]
+        result[stand] = {}
+
+        for pitch, group in subset.groupby("pitch_name"):
+            total = len(group)
+            counts = group["zone"].value_counts()
+            result[stand][pitch] = {zone: round(count / total, 4) for zone, count in counts.items()}
+
+    return result
+
+
+def get_hitter_zone_profile_by_pitch(hitter_df):
+    """Return {p_throws: {pitch_name: {zone: xBA}}}; requires at least 3 samples per cell."""
+    result = {}
+
+    if hitter_df is None or hitter_df.empty:
+        return result
+
+    for hand in ["R", "L"]:
+        subset = hitter_df[hitter_df["p_throws"] == hand].copy()
+        if subset.empty:
+            result[hand] = {}
+            continue
+
+        subset["zone"] = subset.apply(lambda r: assign_zone(r.get("plate_x"), r.get("plate_z")), axis=1)
+        subset = subset[subset["zone"].notna()]
+        result[hand] = {}
+
+        for pitch, group in subset.groupby("pitch_name"):
+            result[hand][pitch] = {}
+
+            for zone, zgroup in group.groupby("zone"):
+                xba_vals = zgroup["estimated_ba_using_speedangle"].dropna()
+                if len(xba_vals) >= 3:
+                    result[hand][pitch][zone] = round(xba_vals.mean(), 3)
+
+    return result
+
+
+def get_league_zone_averages_by_pitch(league_df):
+    """Return {stand: {pitch_name: {zone: league xBA}}}."""
+    if league_df is None or league_df.empty:
+        return {}
+
+    result = {}
+
+    for stand in ["R", "L"]:
+        subset = league_df[league_df["stand"] == stand].copy()
+        if subset.empty:
+            result[stand] = {}
+            continue
+
+        subset["zone"] = subset.apply(lambda r: assign_zone(r.get("plate_x"), r.get("plate_z")), axis=1)
+        subset = subset[subset["zone"].notna()]
+        result[stand] = {}
+
+        for pitch, group in subset.groupby("pitch_name"):
+            result[stand][pitch] = {}
+
+            for zone, zgroup in group.groupby("zone"):
+                xba_vals = zgroup["estimated_ba_using_speedangle"].dropna()
+                if not xba_vals.empty:
+                    result[stand][pitch][zone] = round(xba_vals.mean(), 3)
+
+    return result
+
+
+def compute_zone_scalar_by_pitch(
+    pitcher_zone_profile,
+    hitter_zone_profile,
+    league_zone_avgs,
+    pitcher_pitch_summary,
+    effective_bat_side,
+    pitch_hand,
+):
+    """Blend per-pitch hot/cold zone overlap into one xBA scalar."""
+    pitcher_zones = pitcher_zone_profile.get(effective_bat_side, {})
+    hitter_zones = hitter_zone_profile.get(pitch_hand, {})
+    league_zones = league_zone_avgs.get(effective_bat_side, {})
+
+    if not pitcher_zones or not hitter_zones or not league_zones or not pitcher_pitch_summary:
+        return None, {}
+
+    total_scalar = 0.0
+    total_weight = 0.0
+    per_pitch = {}
+
+    for pitch, usage_stats in pitcher_pitch_summary.items():
+        usage_pct = usage_stats["usage"] / 100
+        p_zones = pitcher_zones.get(pitch, {})
+        h_zones = hitter_zones.get(pitch, {})
+        lg_zones = league_zones.get(pitch, {})
+
+        if not p_zones or not h_zones or not lg_zones:
+            per_pitch[pitch] = {
+                "scalar": None,
+                "usage": usage_pct,
+                "covered_pct": 0,
+                "reason": "no zone data",
+            }
+            continue
+
+        pitch_total = 0.0
+        covered_pct = 0.0
+
+        for zone, p_pct in p_zones.items():
+            h_xba = h_zones.get(zone)
+            lg_xba = lg_zones.get(zone)
+
+            if h_xba is None or lg_xba is None or lg_xba == 0:
+                continue
+
+            pitch_total += p_pct * (h_xba / lg_xba)
+            covered_pct += p_pct
+
+        if covered_pct < 0.25:
+            per_pitch[pitch] = {
+                "scalar": None,
+                "usage": usage_pct,
+                "covered_pct": covered_pct,
+                "reason": f"low coverage ({covered_pct:.0%})",
+            }
+            continue
+
+        pitch_scalar = round(pitch_total / covered_pct, 4)
+        per_pitch[pitch] = {
+            "scalar": pitch_scalar,
+            "usage": usage_pct,
+            "covered_pct": covered_pct,
+            "reason": None,
+        }
+        total_scalar += usage_pct * pitch_scalar
+        total_weight += usage_pct
+
+    if total_weight < 0.3:
+        return None, per_pitch
+
+    return round(total_scalar / total_weight, 4), per_pitch
+
+
 @st.cache_data(show_spinner=False)
 def get_league_averages():
+    global _LEAGUE_RAW_DF_CACHE
+
     current_year = datetime.now().year
     start_date = f"{current_year}-03-01"
     end_date = datetime.now().strftime("%Y-%m-%d")
@@ -100,6 +294,7 @@ def get_league_averages():
     df = statcast(start_dt=start_date, end_dt=end_date)
 
     if df is None or df.empty:
+        _LEAGUE_RAW_DF_CACHE = None
         return {}
 
     df = df[df["pitch_type"].notna()]
@@ -123,6 +318,8 @@ def get_league_averages():
                 "xba": round(xba_vals.mean(), 3) if not xba_vals.empty else None,
                 "xslg": round(xslg_vals.mean(), 3) if not xslg_vals.empty else None,
             }
+
+    _LEAGUE_RAW_DF_CACHE = df
 
     return league_avgs
 
@@ -162,6 +359,7 @@ def get_pitch_data(player_id):
     df = statcast_pitcher(start_date, end_date, player_id)
 
     if df is None or df.empty:
+        _PITCHER_RAW_DF_CACHE[player_id] = None
         return None, None
 
     df = df[df["pitch_type"].notna()]
@@ -170,6 +368,7 @@ def get_pitch_data(player_id):
     df["pitch_name"] = df["pitch_type"].map(
         lambda x: consolidate_pitch(PITCH_NAMES.get(x, x))
     )
+    _PITCHER_RAW_DF_CACHE[player_id] = df
 
     def summarize(subset):
         total = len(subset)
@@ -207,6 +406,7 @@ def get_batter_pitch_data(player_id):
     df = statcast_batter(start_date, end_date, player_id)
 
     if df is None or df.empty:
+        _BATTER_RAW_DF_CACHE[player_id] = None
         return None, None
 
     df = df[df["pitch_type"].notna()]
@@ -215,6 +415,7 @@ def get_batter_pitch_data(player_id):
     df["pitch_name"] = df["pitch_type"].map(
         lambda x: consolidate_pitch(PITCH_NAMES.get(x, x))
     )
+    _BATTER_RAW_DF_CACHE[player_id] = df
 
     def summarize(subset):
         total = len(subset)
@@ -274,12 +475,7 @@ def get_pitcher_k_rate(pitcher_id):
     response = requests.get(url, timeout=20)
     data = response.json()
 
-    stats = data.get("stats", [])
-
-    if not stats:
-        return None
-
-    splits = stats[0].get("splits", [])
+    splits = data.get("stats", [{}])[0].get("splits", [])
 
     if not splits:
         return None
@@ -484,6 +680,157 @@ def get_batter_hit_breakdown(player_id):
     }
 
 
+def get_head_to_head_stats(batter_id, pitcher_id):
+    """Career batter-vs-pitcher BA and AB count from Statcast, blended only when useful."""
+    statcast_first_year = 2015
+    current_year = datetime.now().year
+
+    ab_events = {
+        "single",
+        "double",
+        "triple",
+        "home_run",
+        "strikeout",
+        "field_out",
+        "grounded_into_double_play",
+        "double_play",
+        "triple_play",
+        "fielders_choice",
+        "fielders_choice_out",
+        "force_out",
+        "other_out",
+        "strikeout_double_play",
+        "field_error",
+    }
+    hit_events = {"single", "double", "triple", "home_run"}
+
+    total_ab = 0
+    total_hits = 0
+
+    for year in range(statcast_first_year, current_year + 1):
+        try:
+            df = statcast_batter(f"{year}-03-01", f"{year}-11-30", batter_id)
+
+            if df is None or df.empty:
+                continue
+
+            matchup = df[df["pitcher"] == pitcher_id]
+
+            if matchup.empty:
+                continue
+
+            pa_endings = matchup[matchup["events"].notna()]
+            ab_pa = pa_endings[pa_endings["events"].isin(ab_events)]
+            hit_pa = pa_endings[pa_endings["events"].isin(hit_events)]
+
+            total_ab += len(ab_pa)
+            total_hits += len(hit_pa)
+
+        except Exception:
+            continue
+
+    if total_ab == 0:
+        return None, 0
+
+    return round(total_hits / total_ab, 4), total_ab
+
+
+def blend_matchup_ba(matchup_xba, h2h_ba, h2h_ab, credibility_k=H2H_CREDIBILITY_K):
+    """Blend matchup xBA with career H2H BA, requiring >5 ABs and capping weight at 20%."""
+    if matchup_xba is None:
+        return matchup_xba, 0, None
+
+    if h2h_ba is None or h2h_ab == 0 or h2h_ab <= 5:
+        return matchup_xba, 0, None
+
+    raw_weight = h2h_ab / (h2h_ab + credibility_k)
+    h2h_weight = min(raw_weight, 0.20)
+    blended = round((1 - h2h_weight) * matchup_xba + h2h_weight * h2h_ba, 4)
+
+    return blended, h2h_ab, h2h_weight
+
+
+@st.cache_data(show_spinner=False)
+def get_sprint_speed(player_id):
+    """Fetch sprint speed from the MLB Stats API."""
+    current_year = datetime.now().year
+    url = (
+        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats"
+        f"?stats=sprintSpeed&season={current_year}&group=hitting"
+    )
+
+    response = requests.get(url, timeout=20)
+    data = response.json()
+    splits = data.get("stats", [{}])[0].get("splits", [])
+
+    if not splits:
+        return None
+
+    speed = splits[0].get("stat", {}).get("sprintSpeed")
+
+    try:
+        return float(speed) if speed is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_speed_adjustment(
+    sprint_speed,
+    league_avg=LEAGUE_AVG_SPRINT_SPEED,
+    scalar=SPEED_BABIP_SCALAR,
+    cap=SPEED_ADJ_CAP,
+):
+    """Additive BA delta from sprint speed, capped to keep it small."""
+    if sprint_speed is None:
+        return 0.0, None
+
+    raw_adj = (sprint_speed - league_avg) * scalar
+    adj = round(max(-cap, min(cap, raw_adj)), 4)
+
+    if sprint_speed >= 28.5:
+        tier = "elite speed"
+    elif sprint_speed >= 27.5:
+        tier = "above average"
+    elif sprint_speed >= 26.5:
+        tier = "average"
+    elif sprint_speed >= 25.5:
+        tier = "below average"
+    else:
+        tier = "slow"
+
+    return adj, f"{sprint_speed:.1f} ft/sec ({tier})"
+
+
+def compute_hit_probabilities(matchup_slg, hit_breakdown):
+    if matchup_slg is None or hit_breakdown is None:
+        return None
+
+    tb_weights = {"singles": 1, "doubles": 2, "triples": 3, "home_runs": 4}
+
+    return {
+        hit_type: round(matchup_slg * (hit_breakdown[hit_type]["pct"] / 100) / tb_val, 4)
+        for hit_type, tb_val in tb_weights.items()
+    }
+
+
+def compute_hit_type_probabilities(matchup_ba, hit_breakdown):
+    if matchup_ba is None or hit_breakdown is None:
+        return None
+
+    total_hits = sum(
+        hit_breakdown[k]["count"]
+        for k in ["singles", "doubles", "triples", "home_runs"]
+    )
+
+    if total_hits == 0:
+        return None
+
+    return {
+        hit_type: round(matchup_ba * hit_breakdown[hit_type]["count"] / total_hits, 4)
+        for hit_type in ["singles", "doubles", "triples", "home_runs"]
+    }
+
+
 def compute_betting_odds(
     matchup_ba,
     matchup_slg,
@@ -493,17 +840,18 @@ def compute_betting_odds(
     k_rate_per_ab,
     ab_per_game,
 ):
+    """
+    matchup xBA/xSLG are BIP metrics, so K-rate is applied to matchup ABs only.
+    Season AVG/SLG are observed stats with strikeouts already reflected.
+    """
     results = {}
 
     def to_ml(prob):
-        if prob is None:
+        if prob is None or prob <= 0:
             return "N/A"
 
         if prob >= 1.0:
             return "+∞"
-
-        if prob <= 0.0:
-            return "N/A"
 
         if prob > 0.5:
             return f"-{round((prob / (1 - prob)) * 100)}"
@@ -513,75 +861,35 @@ def compute_betting_odds(
     total_abs = ab_per_game if ab_per_game is not None else 3.5
     matchup_abs = min(2.5, total_abs)
     season_abs = max(0.0, total_abs - matchup_abs)
-
     kr = k_rate_per_ab if k_rate_per_ab is not None else 0.0
 
     m_ba = matchup_ba * (1 - kr) if matchup_ba is not None else None
     m_slg = matchup_slg * (1 - kr) if matchup_slg is not None else None
-    s_ba = season_avg_f * (1 - kr) if season_avg_f is not None else None
-    s_slg = season_slg_f * (1 - kr) if season_slg_f is not None else None
+    s_ba = season_avg_f
+    s_slg = season_slg_f
 
-    # --- At least 1 hit ---
     if m_ba is not None and s_ba is not None:
         p_no_hit = ((1 - m_ba) ** matchup_abs) * ((1 - s_ba) ** season_abs)
-        p_1hit = round(1 - p_no_hit, 4)
-
-        results["1_hit"] = {
-            "prob": p_1hit,
-            "ml": to_ml(p_1hit),
-        }
+        results["1_hit"] = {"prob": round(1 - p_no_hit, 4)}
     else:
-        results["1_hit"] = {
-            "prob": None,
-            "ml": "N/A",
-        }
+        results["1_hit"] = {"prob": None}
 
-    # --- At least 2 hits ---
     if m_ba is not None and s_ba is not None and total_abs > 0:
         eff_ba = (m_ba * matchup_abs + s_ba * season_abs) / total_abs
-
         p0 = (1 - eff_ba) ** total_abs
         p1 = total_abs * eff_ba * ((1 - eff_ba) ** (total_abs - 1))
-        p_2hit = round(1 - p0 - p1, 4)
-
-        results["2_hits"] = {
-            "prob": p_2hit,
-            "ml": to_ml(p_2hit),
-        }
+        results["2_hits"] = {"prob": round(1 - p0 - p1, 4)}
+        _p0, _p1, _eff_ba = p0, p1, eff_ba
     else:
-        results["2_hits"] = {
-            "prob": None,
-            "ml": "N/A",
-        }
+        results["2_hits"] = {"prob": None}
+        _p0 = _p1 = _eff_ba = None
 
-    # --- At least 3 hits ---
-    if m_ba is not None and s_ba is not None and total_abs > 0:
-        eff_ba = (m_ba * matchup_abs + s_ba * season_abs) / total_abs
-
-        p0 = (1 - eff_ba) ** total_abs
-        p1 = total_abs * eff_ba * ((1 - eff_ba) ** (total_abs - 1))
-
-        p2 = (
-            comb(int(total_abs), 2)
-            * (eff_ba**2)
-            * ((1 - eff_ba) ** (total_abs - 2))
-            if total_abs >= 2
-            else 0
-        )
-
-        p_3hit = round(1 - p0 - p1 - p2, 4)
-
-        results["3_hits"] = {
-            "prob": p_3hit,
-            "ml": to_ml(p_3hit),
-        }
+    if _p0 is not None and total_abs >= 2:
+        p2 = comb(int(total_abs), 2) * (_eff_ba**2) * ((1 - _eff_ba) ** (total_abs - 2))
+        results["3_hits"] = {"prob": round(1 - _p0 - _p1 - p2, 4)}
     else:
-        results["3_hits"] = {
-            "prob": None,
-            "ml": "N/A",
-        }
+        results["3_hits"] = {"prob": None}
 
-    # --- At least 2 TB ---
     if (
         hit_breakdown
         and m_ba is not None
@@ -617,10 +925,7 @@ def compute_betting_odds(
                 m_ba * trp_share,
                 m_slg * (hit_breakdown["triples"]["pct"] / 100) / 3,
             )
-            mm_hr = blend(
-                m_ba * hr_share,
-                m_slg * hr_tb_pct / 4,
-            )
+            mm_hr = blend(m_ba * hr_share, m_slg * hr_tb_pct / 4)
 
             ss_sng = blend(
                 s_ba * sng_share,
@@ -634,10 +939,7 @@ def compute_betting_odds(
                 s_ba * trp_share,
                 s_slg * (hit_breakdown["triples"]["pct"] / 100) / 3,
             )
-            ss_hr = blend(
-                s_ba * hr_share,
-                s_slg * hr_tb_pct / 4,
-            )
+            ss_hr = blend(s_ba * hr_share, s_slg * hr_tb_pct / 4)
 
             m_no_hit = 1 - mm_sng - mm_dbl - mm_trp - mm_hr
             s_no_hit = 1 - ss_sng - ss_dbl - ss_trp - ss_hr
@@ -656,24 +958,12 @@ def compute_betting_odds(
                 * (s_no_hit ** (season_abs - 1))
             )
 
-            p_2tb = round(1 - p_no_hit - p_one_single, 4)
-
-            results["2_tb"] = {
-                "prob": p_2tb,
-                "ml": to_ml(p_2tb),
-            }
+            results["2_tb"] = {"prob": round(1 - p_no_hit - p_one_single, 4)}
         else:
-            results["2_tb"] = {
-                "prob": None,
-                "ml": "N/A",
-            }
+            results["2_tb"] = {"prob": None}
     else:
-        results["2_tb"] = {
-            "prob": None,
-            "ml": "N/A",
-        }
+        results["2_tb"] = {"prob": None}
 
-    # --- Home Run ---
     hr_prob_ba = None
     hr_prob_slg = None
 
@@ -685,40 +975,29 @@ def compute_betting_odds(
 
         if total_hits > 0:
             hr_share = hit_breakdown["home_runs"]["count"] / total_hits
-            matchup_hr_p = m_ba * hr_share
-            season_hr_p = s_ba * hr_share
-
-            p_no_hr = ((1 - matchup_hr_p) ** matchup_abs) * (
-                (1 - season_hr_p) ** season_abs
+            p_no_hr = ((1 - m_ba * hr_share) ** matchup_abs) * (
+                (1 - s_ba * hr_share) ** season_abs
             )
-
             hr_prob_ba = round(1 - p_no_hr, 4)
 
     if hit_breakdown and m_slg is not None and s_slg is not None:
         hr_tb_pct = hit_breakdown["home_runs"]["pct"] / 100
-
-        matchup_hr_p = m_slg * hr_tb_pct / 4
-        season_hr_p = s_slg * hr_tb_pct / 4
-
-        p_no_hr = ((1 - matchup_hr_p) ** matchup_abs) * (
-            (1 - season_hr_p) ** season_abs
+        p_no_hr = ((1 - m_slg * hr_tb_pct / 4) ** matchup_abs) * (
+            (1 - s_slg * hr_tb_pct / 4) ** season_abs
         )
-
         hr_prob_slg = round(1 - p_no_hr, 4)
 
     if hr_prob_ba is not None and hr_prob_slg is not None:
         hr_final = round((hr_prob_ba + hr_prob_slg) / 2, 4)
     elif hr_prob_ba is not None:
         hr_final = hr_prob_ba
-    elif hr_prob_slg is not None:
-        hr_final = hr_prob_slg
     else:
-        hr_final = None
+        hr_final = hr_prob_slg
 
-    results["hr"] = {
-        "prob": hr_final,
-        "ml": to_ml(hr_final),
-    }
+    results["hr"] = {"prob": hr_final}
+
+    for key in results:
+        results[key]["ml"] = to_ml(results[key]["prob"])
 
     return results
 
@@ -747,7 +1026,9 @@ def build_hitter_row(
             "Hitter Name": hitter_name,
             "abs": "N/A",
             "Prob 1 hit": "N/A",
+            "1 Hit ML": "N/A",
             "Prob 2 hits": "N/A",
+            "2 Hit ML": "N/A",
         }
 
     bat_side, _ = get_player_handedness(hitter_id)
@@ -786,10 +1067,52 @@ def build_hitter_row(
     else:
         k_rate_adjusted = k_rate_per_ab
 
+    pitcher_df = _PITCHER_RAW_DF_CACHE.get(pitcher_id)
+    hitter_df = _BATTER_RAW_DF_CACHE.get(hitter_id)
+    league_df = _LEAGUE_RAW_DF_CACHE
+
+    zone_scalar = None
+
+    if pitcher_df is not None and hitter_df is not None and league_df is not None:
+        pitcher_zone_profile = get_pitcher_zone_profile_by_pitch(pitcher_df)
+        hitter_zone_profile = get_hitter_zone_profile_by_pitch(hitter_df)
+        league_zone_avgs = get_league_zone_averages_by_pitch(league_df)
+
+        zone_scalar, _ = compute_zone_scalar_by_pitch(
+            pitcher_zone_profile,
+            hitter_zone_profile,
+            league_zone_avgs,
+            pitcher_relevant_split,
+            effective_bat_side,
+            pitch_hand,
+        )
+
+    matchup_ba_zoned = (
+        round(matchup_ba * zone_scalar, 4)
+        if matchup_ba is not None and zone_scalar is not None
+        else matchup_ba
+    )
+
+    h2h_ba, h2h_ab = get_head_to_head_stats(hitter_id, pitcher_id)
+    matchup_ba_blended, _, _ = blend_matchup_ba(matchup_ba_zoned, h2h_ba, h2h_ab)
+
+    sprint_speed = get_sprint_speed(hitter_id)
+    speed_adj, _ = compute_speed_adjustment(sprint_speed)
+
+    matchup_ba_final = (
+        round(matchup_ba_blended + speed_adj, 4)
+        if matchup_ba_blended is not None
+        else None
+    )
+
+    # Half-weight speed nudge to season AVG because observed average already partially includes speed.
+    if season_avg_f is not None:
+        season_avg_f = round(season_avg_f + speed_adj * 0.5, 4)
+
     hit_breakdown = get_batter_hit_breakdown(hitter_id)
 
     betting_odds = compute_betting_odds(
-        matchup_ba,
+        matchup_ba_final,
         matchup_slg,
         season_avg_f,
         season_slg_f,
@@ -808,6 +1131,7 @@ def build_hitter_row(
         "Prob 2 hits": format_probability(betting_odds["2_hits"]["prob"]),
         "2 Hit ML": betting_odds["2_hits"]["ml"],
     }
+
 
 def split_dict_to_df(split_dict):
     """

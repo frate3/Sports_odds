@@ -342,7 +342,11 @@ if st.session_state.get("show_history"):
             line_value = float(selected_row["Line"])
             wager_value = float(selected_row["Wager"])
 
-            if manual_hits > line_value:
+            
+            if manual_hits > line_value and line_value != 0:
+                manual_payout = round(calc_payout(selected_row["Odds"], wager_value), 2)
+                print("here")
+            elif line_value==0 and manual_hits==0:
                 manual_payout = round(calc_payout(selected_row["Odds"], wager_value), 2)
             else:
                 manual_payout = 0
@@ -364,7 +368,8 @@ if st.session_state.get("show_history"):
                 st.rerun()
 
         except Exception as exc:
-            st.error(f"Could not calculate manual payout: {exc}")
+            # st.error(f"Could not calculate manual payout: {exc}")
+            print(" ")
 
 # Show results table if a matchup has been run
 if "matchup_df" in st.session_state:

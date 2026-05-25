@@ -1,37 +1,32 @@
-from pybaseball import statcast
-from kalshi_handle import get_kalshi_hit_odds
+import pytest
+import pandas as pd
+from pandas.testing import assert_frame_equal, assert_series_equal
+from pybaseball.plotting import transform_coordinates
 
 
-def american_to_probability(odds):
-    odds = int(odds)
-    if odds < 0:
-        return abs(odds) / (abs(odds) + 100)
-    return 100 / (odds + 100)
-
-def get_kalshi_hit_percents(player_name):
-    """
-    Returns Kalshi implied percentages for 1+ hits and 2+ hits.
-    """
-    try:
-        kalshi_df = get_kalshi_hit_odds(player_name)
-        
-        if kalshi_df is None or kalshi_df.empty:
-            return "N/A", "N/A"
-            kalshi_df = get_kalshi_hit_odds(player_name)
-    
-        if kalshi_df is None or kalshi_df.empty:
-            print( "N/A", "N/A")
-
-        one_hit_row = kalshi_df[1]
-        two_hit_row = kalshi_df[2]
-        
-        kalshi_1 = f"{round(american_to_probability(one_hit_row),2)*100}%"
-        kalshi_2 = f"{round(american_to_probability(two_hit_row),2)*100}%"
-
-        return kalshi_1, kalshi_2
-
-    except Exception:
-        return "N/A", "N/A"
+@pytest.fixture
+def coords():
+    return pd.DataFrame({"x": [1.0, 2.0, -1.0], "y": [1.0, 0.0, 10.0]})
 
 
-print(get_kalshi_hit_percents("Munetaka Murakami"))
+def test_transform_coordinates_identity_scale(coords):
+    transformed_coords = transform_coordinates(coords, scale=1)
+    assert_series_equal(coords.x, transformed_coords.x)
+    assert_series_equal(-coords.y, transformed_coords.y)
+
+
+
+def test_transform_coordinates(coords):
+    transformed_coords = transform_coordinates(coords, scale=2, x_center=0, y_center=0)
+    assert_series_equal(2 * coords.x, transformed_coords.x)
+    assert_series_equal(-2 * coords.y, transformed_coords.y)
+
+    transformed_coords = transform_coordinates(coords, scale=2, x_center=1, y_center=1)
+    expected = pd.DataFrame({"x": [1.0, 3.0, -3.0], "y": [-1.0, 1.0, -19.0]})
+    assert_frame_equal(expected, transformed_coords)
+
+    xc = 123.4
+    yc = 432.1
+    transformed_coords = transform_coordinates(coords, scale=0, x_center=xc, y_center=yc)
+    assert_series_equal(pd.Series(name="x", data=3 * [xc]), transformed_coords.x)
+    assert_series_equal(pd.Series(name="y", data=3 * [yc]), -transformed_coords.y)
