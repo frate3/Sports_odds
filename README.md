@@ -8,3 +8,4 @@
 - prediction tool for 20 picks per day 
 - history table needs filters like yesterday, today, last week
 - get probable pitchers and matchups
+    - run matchups in the morning for quicker real run time

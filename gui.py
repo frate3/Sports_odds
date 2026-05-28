@@ -6,17 +6,77 @@ import pandas as pd
 import requests
 import streamlit as st
 from pybaseball import cache
+import os
 
 import calc
+import probable
 from bet_handle import create_entry, fill_blanks, search_db, calc_payout, write_to_db
 from kalshi_handle import get_kalshi_hit_odds
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 cache.enable()
 
-## To add
-# - table headers for 1 day or 1 week 
-# - graph 
+def build_payout_summary():
+    """Build day-by-day profit totals for the payout view."""
+    rows = search_db(only_open=False)
+
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    if df.empty or "Payout" not in df.columns or "Wager" not in df.columns:
+        return df, pd.DataFrame()
+
+    df["Payout"] = pd.to_numeric(df["Payout"], errors="coerce")
+    df["Wager"] = pd.to_numeric(df["Wager"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    settled_df = df.dropna(subset=["Date", "Payout", "Wager"]).copy()
+
+    if settled_df.empty:
+        return df, pd.DataFrame()
+
+    settled_df["Profit"] = settled_df["Payout"] - settled_df["Wager"]
+
+    daily_profit = (
+        settled_df.groupby(settled_df["Date"].dt.date)["Profit"]
+        .sum()
+        .reset_index(name="Daily Profit")
+    )
+
+    daily_profit["Date"] = pd.to_datetime(daily_profit["Date"])
+    daily_profit = daily_profit.sort_values("Date")
+    daily_profit["Net Before Day"] = (
+        daily_profit["Daily Profit"].cumsum().shift(1).fillna(0)
+    )
+    daily_profit["Net After Day"] = daily_profit["Daily Profit"].cumsum()
+
+    return df, daily_profit
+
+def load_cached_matchup(hitter_team_name, pitcher_name):
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    cache_dir = "data/matchup_cache"
+
+    if not os.path.exists(cache_dir):
+        return None
+
+    hitter_team_key = hitter_team_name.replace(" ", "_")
+    pitcher_key = pitcher_name.replace(" ", "_")
+
+    for filename in os.listdir(cache_dir):
+        if not filename.endswith(".csv"):
+            continue
+
+        if not filename.startswith(today):
+            continue
+
+        if hitter_team_key in filename and pitcher_key in filename:
+            path = os.path.join(cache_dir, filename)
+            return pd.read_csv(path)
+
+    return None
 
 def american_to_probability(odds):
     odds = int(odds)
@@ -120,48 +180,170 @@ st.set_page_config(page_title="MLB Matchup Tool", layout="wide")
 
 st.title("MLB Matchup Tool")
 
-left_col, right_col = st.columns(2)
+st.markdown("""
+<style>
+.game-card-title {
+    font-size: 0.9rem;
+    font-weight: 700;
+    margin-bottom: 0.35rem;
+}
 
-with left_col:
-    st.header("Team 1 Pitcher")
+.game-team-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 1.05rem;
+    font-weight: 700;
+    padding: 0.15rem 0;
+}
 
-    team1_name = st.selectbox(
-        "Select Team 1",
-        list(calc.teams.keys()),
-        key="team1",
-    )
+.game-selected {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: #77dd77;
+}
 
-    team1_id = calc.teams[team1_name]
-    pitchers = calc.get_pitchers(team1_id)
+.selected-matchup-box {
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-top: 0.75rem;
+    background-color: #1f1f1f;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    if pitchers:
-        pitcher_name = st.selectbox(
-            "Select Pitcher",
-            list(pitchers.keys()),
-            key="pitcher",
-        )
 
-        pitcher_id = pitchers[pitcher_name]
+def select_probable_matchup(game, batting_side):
+    """
+    batting_side:
+        'away' means away team hitters vs home probable pitcher
+        'home' means home team hitters vs away probable pitcher
+    """
+
+    if batting_side == "away":
+        hitter_team_name = game["away_team"]
+        hitter_team_id = game["away_team_id"]
+        pitcher_name = game["home_pitcher_name"]
+        pitcher_id = game["home_pitcher_id"]
     else:
-        pitcher_name = None
-        pitcher_id = None
-        st.warning("No pitchers found for this team.")
+        hitter_team_name = game["home_team"]
+        hitter_team_id = game["home_team_id"]
+        pitcher_name = game["away_pitcher_name"]
+        pitcher_id = game["away_pitcher_id"]
 
-with right_col:
-    st.header("Team 2 Batters")
+    st.session_state["selected_batting_side"] = batting_side
+    st.session_state["selected_game_key"] = f"{game['away_team']}@{game['home_team']}"
 
-    team2_name = st.selectbox(
-        "Select Team 2",
-        list(calc.teams.keys()),
-        key="team2",
+    st.session_state["team2_name"] = hitter_team_name
+    st.session_state["team2_id"] = hitter_team_id
+    st.session_state["pitcher_name"] = pitcher_name
+    st.session_state["pitcher_id"] = pitcher_id
+
+    # Clear old table/splits when switching games.
+    for key in [
+        "matchup_df",
+        "selected_hitter_name",
+        "selected_hitter_id",
+        "vs_right",
+        "vs_left",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+st.subheader("Today's Probable Matchups")
+
+try:
+    today_games = probable.get_today_probable_games()
+except Exception as exc:
+    today_games = []
+    st.error(f"Could not load today's probable games: {exc}")
+
+if not today_games:
+    st.warning("No probable games found for today.")
+
+else:
+    games_per_row = 6
+
+    for start in range(0, len(today_games), games_per_row):
+        row_games = today_games[start:start + games_per_row]
+        game_cols = st.columns(len(row_games))
+
+        for i, game in enumerate(row_games):
+            game_index = start + i
+            game_key = f"{game['away_team']}@{game['home_team']}"
+
+            away_selected = (
+                st.session_state.get("selected_game_key") == game_key
+                and st.session_state.get("selected_batting_side") == "away"
+            )
+
+            home_selected = (
+                st.session_state.get("selected_game_key") == game_key
+                and st.session_state.get("selected_batting_side") == "home"
+            )
+
+            with game_cols[i]:
+                with st.container(border=True):
+                    st.markdown(
+                        f"""
+                        <div class="game-card-title">Game {game_index + 1}</div>
+
+                        <div class="game-team-row">
+                            <span>{game.get("away_abbr", game["away_team"][:3].upper())}</span>
+                            <span>{"Viewing" if away_selected else ""}</span>
+                        </div>
+
+                        <div class="game-team-row">
+                            <span>{game.get("home_abbr", game["home_team"][:3].upper())}</span>
+                            <span>{"Viewing" if home_selected else ""}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    away_disabled = game["home_pitcher_id"] is None
+                    home_disabled = game["away_pitcher_id"] is None
+
+                    if st.button(
+                        f"{game.get('away_abbr', game['away_team'][:3].upper())} batting",
+                        key=f"select_away_batting_{game_index}",
+                        use_container_width=True,
+                        disabled=away_disabled,
+                    ):
+                        select_probable_matchup(game, "away")
+                        st.rerun()
+
+                    if st.button(
+                        f"{game.get('home_abbr', game['home_team'][:3].upper())} batting",
+                        key=f"select_home_batting_{game_index}",
+                        use_container_width=True,
+                        disabled=home_disabled,
+                    ):
+                        select_probable_matchup(game, "home")
+                        st.rerun()
+
+team2_name = st.session_state.get("team2_name")
+team2_id = st.session_state.get("team2_id")
+pitcher_name = st.session_state.get("pitcher_name")
+pitcher_id = st.session_state.get("pitcher_id")
+
+if team2_name and pitcher_name:
+    st.markdown(
+        f"""
+        <div class="selected-matchup-box">
+            <b>Viewing:</b> {team2_name} batters vs {pitcher_name}
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    team2_id = calc.teams[team2_name]
-    hitters = calc.get_hitters(team2_id)
+hitters = calc.get_hitters(team2_id) if team2_id else {}
 
 st.divider()
 
-btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([1, 1, 1, 1])
 
 with btn_col1:
     run_matchup_clicked = st.button("Run Matchup", type="primary")
@@ -172,94 +354,114 @@ with btn_col2:
 with btn_col3:
     view_history_clicked = st.button("View History", type="primary")
 
+with btn_col4:
+    payout_clicked = st.button("Payout", type="primary")
+
 if view_history_clicked:
     st.session_state["show_history"] = not st.session_state.get("show_history", False)
 
-if run_matchup_clicked:    
-    if pitcher_id is None:
-        st.error("Select a pitcher first.")
+if payout_clicked:
+    st.session_state["show_payout"] = not st.session_state.get("show_payout", False)
 
-    elif not hitters:
-        st.error("No hitters found for Team 2.")
+if run_matchup_clicked:
+    if pitcher_id is None or team2_id is None:
+        st.error("Select a game and batting team first.")
 
     else:
-        with st.spinner("Fetching pitcher data, league averages, and hitter projections..."):
-            vs_right, vs_left = calc.get_pitch_data(pitcher_id)
+        cached_df = load_cached_matchup(team2_name, pitcher_name)
 
-            league_avgs = calc.get_league_averages()
-            lg_right = league_avgs.get("R", {})
-            lg_left = league_avgs.get("L", {})
+        if cached_df is not None:
+            st.success("Loaded today's precomputed matchup table.")
 
-            pitcher_k_rate, league_k_rate, pitcher_k_ratio = calc.get_pitcher_k_ratio(
-                pitcher_id
-            )
-
-        if vs_right is None and vs_left is None:
-            st.error("No Statcast data found for this pitcher this season.")
-
-        else:
-            rows = []
-
-            progress = st.progress(0)
-            hitter_items = list(hitters.items())
-
-            for i, (hitter_name, hitter_id) in enumerate(hitter_items, start=1):
-                try:
-                    row = calc.build_hitter_row(
-                        hitter_name=hitter_name,
-                        hitter_id=hitter_id,
-                        pitcher_id=pitcher_id,
-                        vs_right=vs_right,
-                        vs_left=vs_left,
-                        lg_right=lg_right,
-                        lg_left=lg_left,
-                        pitcher_k_ratio=pitcher_k_ratio,
-                    )
-
-                    kalshi_1_hit, kalshi_2_hits = get_kalshi_hit_percents(hitter_name)
-
-                    row["Kalshi 1 hit %"] = kalshi_1_hit
-                    row["Kalshi 2 hit %"] = kalshi_2_hits
-
-                    # Keep hitter ID internally so we know which row was clicked
-                    row["Hitter ID"] = hitter_id
-
-                except Exception as exc:
-                    row = {
-                        "Hitter Name": hitter_name,
-                        "abs": "Error",
-                        "Prob 1 hit": "Error",
-                        "Kalshi 1 hit %": "Error",
-                        "Prob 2 hits": "Error",
-                        "Kalshi 2 hit %": "Error",
-                        "Hitter ID": hitter_id,
-                    }
-
-                    st.caption(f"Skipped {hitter_name}: {exc}")
-
-                rows.append(row)
-                progress.progress(i / len(hitter_items))
-
-            df = pd.DataFrame(
-                rows,
-                columns=[
-                    "Hitter Name",
-                    "abs",
-                    "Prob 1 hit",
-                    "Kalshi 1 hit %",
-                    "Prob 2 hits",
-                    "Kalshi 2 hit %",
-                    "Hitter ID",
-                ],
-            )
-
-            # Save everything needed so clicking a row still works after Streamlit reruns
-            st.session_state["matchup_df"] = df
+            st.session_state["matchup_df"] = cached_df
             st.session_state["pitcher_id"] = pitcher_id
             st.session_state["pitcher_name"] = pitcher_name
             st.session_state["team2_name"] = team2_name
+
+            # Optional: only needed if you want the split view to work immediately.
+            with st.spinner("Loading pitcher split data for detail view..."):
+                vs_right, vs_left = calc.get_pitch_data(pitcher_id)
+
             st.session_state["vs_right"] = vs_right
             st.session_state["vs_left"] = vs_left
+
+        else:
+            st.warning("No cached matchup found. Running live calculation.")
+
+            with st.spinner("Fetching pitcher data, league averages, and hitter projections..."):
+                vs_right, vs_left = calc.get_pitch_data(pitcher_id)
+
+                league_avgs = calc.get_league_averages()
+                lg_right = league_avgs.get("R", {})
+                lg_left = league_avgs.get("L", {})
+
+                pitcher_k_rate, league_k_rate, pitcher_k_ratio = calc.get_pitcher_k_ratio(
+                    pitcher_id
+                )
+
+            if vs_right is None and vs_left is None:
+                st.error("No Statcast data found for this pitcher this season.")
+
+            else:
+                rows = []
+
+                progress = st.progress(0)
+                hitter_items = list(hitters.items())
+
+                for i, (hitter_name, hitter_id) in enumerate(hitter_items, start=1):
+                    try:
+                        row = calc.build_hitter_row(
+                            hitter_name=hitter_name,
+                            hitter_id=hitter_id,
+                            pitcher_id=pitcher_id,
+                            vs_right=vs_right,
+                            vs_left=vs_left,
+                            lg_right=lg_right,
+                            lg_left=lg_left,
+                            pitcher_k_ratio=pitcher_k_ratio,
+                        )
+
+                        kalshi_1_hit, kalshi_2_hits = get_kalshi_hit_percents(hitter_name)
+
+                        row["Kalshi 1 hit %"] = kalshi_1_hit
+                        row["Kalshi 2 hit %"] = kalshi_2_hits
+                        row["Hitter ID"] = hitter_id
+
+                    except Exception as exc:
+                        row = {
+                            "Hitter Name": hitter_name,
+                            "abs": "Error",
+                            "Prob 1 hit": "Error",
+                            "Kalshi 1 hit %": "Error",
+                            "Prob 2 hits": "Error",
+                            "Kalshi 2 hit %": "Error",
+                            "Hitter ID": hitter_id,
+                        }
+
+                        st.caption(f"Skipped {hitter_name}: {exc}")
+
+                    rows.append(row)
+                    progress.progress(i / len(hitter_items))
+
+                df = pd.DataFrame(
+                    rows,
+                    columns=[
+                        "Hitter Name",
+                        "abs",
+                        "Prob 1 hit",
+                        "Kalshi 1 hit %",
+                        "Prob 2 hits",
+                        "Kalshi 2 hit %",
+                        "Hitter ID",
+                    ],
+                )
+
+                st.session_state["matchup_df"] = df
+                st.session_state["pitcher_id"] = pitcher_id
+                st.session_state["pitcher_name"] = pitcher_name
+                st.session_state["team2_name"] = team2_name
+                st.session_state["vs_right"] = vs_right
+                st.session_state["vs_left"] = vs_left
 
 
 # -----------------------------
@@ -267,6 +469,47 @@ if run_matchup_clicked:
 # -----------------------------
 if view_history_clicked:
     st.session_state["show_history"] = True
+
+if st.session_state.get("show_payout"):
+    st.divider()
+    st.subheader("Payout Summary")
+
+    try:
+        _, daily_profit = build_payout_summary()
+
+        if daily_profit.empty:
+            st.info("No settled bets with payouts yet.")
+        else:
+            total_profit = daily_profit["Daily Profit"].sum()
+            last_net = daily_profit["Net After Day"].iloc[-1]
+            best_day = daily_profit["Daily Profit"].max()
+            worst_day = daily_profit["Daily Profit"].min()
+
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            metric_col1.metric("Total Profit", f"${total_profit:.2f}")
+            metric_col2.metric("Current Net", f"${last_net:.2f}")
+            metric_col3.metric("Best Day", f"${best_day:.2f}")
+            metric_col4.metric("Worst Day", f"${worst_day:.2f}")
+
+            chart_df = daily_profit.set_index("Date")[[
+                "Daily Profit",
+                "Net Before Day",
+                "Net After Day",
+            ]]
+
+            st.line_chart(chart_df, use_container_width=True)
+
+            table_df = daily_profit.copy()
+            table_df["Date"] = table_df["Date"].dt.strftime("%Y-%m-%d")
+
+            st.dataframe(
+                table_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    except Exception as exc:
+        st.error(f"Could not load payout summary: {exc}")
 
 if st.session_state.get("show_history"):
     st.divider()

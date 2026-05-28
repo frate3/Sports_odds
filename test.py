@@ -2,31 +2,44 @@ import pytest
 import pandas as pd
 from pandas.testing import assert_frame_equal, assert_series_equal
 from pybaseball.plotting import transform_coordinates
+from datetime import datetime
+import requests
 
 
-@pytest.fixture
-def coords():
-    return pd.DataFrame({"x": [1.0, 2.0, -1.0], "y": [1.0, 0.0, 10.0]})
+def get_probable_pitchers_for_today():
+    today = datetime.now().strftime("%Y-%m-%d")
 
+    url = (
+        "https://statsapi.mlb.com/api/v1/schedule"
+        f"?sportId=1&date={today}&hydrate=probablePitcher,team"
+    )
 
-def test_transform_coordinates_identity_scale(coords):
-    transformed_coords = transform_coordinates(coords, scale=1)
-    assert_series_equal(coords.x, transformed_coords.x)
-    assert_series_equal(-coords.y, transformed_coords.y)
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    data = response.json()
 
+    probable = {}
 
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            away_team = game["teams"]["away"]["team"]["name"]
+            home_team = game["teams"]["home"]["team"]["name"]
 
-def test_transform_coordinates(coords):
-    transformed_coords = transform_coordinates(coords, scale=2, x_center=0, y_center=0)
-    assert_series_equal(2 * coords.x, transformed_coords.x)
-    assert_series_equal(-2 * coords.y, transformed_coords.y)
+            away_pitcher = game["teams"]["away"].get("probablePitcher")
+            home_pitcher = game["teams"]["home"].get("probablePitcher")
 
-    transformed_coords = transform_coordinates(coords, scale=2, x_center=1, y_center=1)
-    expected = pd.DataFrame({"x": [1.0, 3.0, -3.0], "y": [-1.0, 1.0, -19.0]})
-    assert_frame_equal(expected, transformed_coords)
+            probable[away_team] = {
+                "opponent": home_team,
+                "pitcher_name": away_pitcher.get("fullName") if away_pitcher else None,
+                "pitcher_id": away_pitcher.get("id") if away_pitcher else None,
+            }
 
-    xc = 123.4
-    yc = 432.1
-    transformed_coords = transform_coordinates(coords, scale=0, x_center=xc, y_center=yc)
-    assert_series_equal(pd.Series(name="x", data=3 * [xc]), transformed_coords.x)
-    assert_series_equal(pd.Series(name="y", data=3 * [yc]), -transformed_coords.y)
+            probable[home_team] = {
+                "opponent": away_team,
+                "pitcher_name": home_pitcher.get("fullName") if home_pitcher else None,
+                "pitcher_id": home_pitcher.get("id") if home_pitcher else None,
+            }
+
+    return probable
+
+print(get_probable_pitchers_for_today())
