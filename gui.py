@@ -12,6 +12,7 @@ import calc
 import probable
 from bet_handle import create_entry, fill_blanks, search_db, calc_payout, write_to_db
 from kalshi_handle import get_kalshi_hit_odds
+from time_handle import get_game_start_times
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 cache.enable()
@@ -265,6 +266,7 @@ if not today_games:
 
 else:
     games_per_row = 6
+    times_df = get_game_start_times()
 
     for start in range(0, len(today_games), games_per_row):
         row_games = today_games[start:start + games_per_row]
@@ -288,7 +290,7 @@ else:
                 with st.container(border=True):
                     st.markdown(
                         f"""
-                        <div class="game-card-title">Game {game_index + 1}</div>
+                        <div class="game-card-title">{times_df["start_time"][i]} - {times_df["status"][i]}</div>
 
                         <div class="game-team-row">
                             <span>{game.get("away_abbr", game["away_team"][:3].upper())}</span>
@@ -372,6 +374,25 @@ if run_matchup_clicked:
 
         if cached_df is not None:
             st.success("Loaded today's precomputed matchup table.")
+
+            kalshi_1_values = []
+            kalshi_2_values = []
+
+            progress = st.progress(0, text="Fetching fresh Kalshi odds...")
+
+            for i, hitter_name in enumerate(cached_df["Hitter Name"], start=1):
+                kalshi_1_hit, kalshi_2_hits = get_kalshi_hit_percents(hitter_name)
+
+                kalshi_1_values.append(kalshi_1_hit)
+                kalshi_2_values.append(kalshi_2_hits)
+
+                progress.progress(
+                    i / len(cached_df),
+                    text=f"Fetching fresh Kalshi odds... {i}/{len(cached_df)}",
+                )
+
+            cached_df["Kalshi 1 hit %"] = kalshi_1_values
+            cached_df["Kalshi 2 hit %"] = kalshi_2_values
 
             st.session_state["matchup_df"] = cached_df
             st.session_state["pitcher_id"] = pitcher_id
@@ -467,8 +488,6 @@ if run_matchup_clicked:
 # -----------------------------
 # View / Manually Settle History
 # -----------------------------
-if view_history_clicked:
-    st.session_state["show_history"] = True
 
 if st.session_state.get("show_payout"):
     st.divider()
@@ -624,7 +643,18 @@ if "matchup_df" in st.session_state:
 
     st.caption("Click a hitter row to see the batter and pitcher pitch-type splits used for that matchup.")
 
-    display_df = df.drop(columns=["Hitter ID"])
+    shown_columns = [
+    "Hitter Name",
+    "abs",
+    "Prob 1 hit",
+    "Kalshi 1 hit %",
+    "Prob 2 hits",
+    "Kalshi 2 hit %",
+    ]
+
+    display_df = df[
+        [col for col in shown_columns if col in df.columns]
+    ]
 
     table_event = st.dataframe(
         display_df,
