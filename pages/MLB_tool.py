@@ -8,11 +8,11 @@ import streamlit as st
 from pybaseball import cache
 import os
 
-import calc
-import probable
-from bet_handle import create_entry, fill_blanks, search_db, calc_payout, write_to_db
-from kalshi_handle import get_kalshi_hit_odds
-from time_handle import get_game_start_times
+import MLB.calc as calc
+import MLB.probable as probable
+from MLB.bet_handle import create_entry, fill_blanks, search_db, calc_payout, write_to_db
+from MLB.kalshi_handle import get_kalshi_hit_odds
+from MLB.time_handle import get_game_start_times
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 cache.enable()
@@ -85,7 +85,6 @@ def american_to_probability(odds):
         return abs(odds) / (abs(odds) + 100)
     return 100 / (odds + 100)
 
-
 def probability_to_american(prob):
     if prob is None or prob <= 0 or prob >= 1:
         return None
@@ -93,13 +92,11 @@ def probability_to_american(prob):
         return f"-{round(100 * prob / (1 - prob))}"
     return f"+{round(100 * (1 - prob) / prob)}"
 
-
 def format_american(odds):
     if odds is None or odds == "N/A":
         return "N/A"
     odds = int(odds)
     return f"+{odds}" if odds > 0 else str(odds)
-
 
 def normalize_hit_odds(raw_odds):
     """
@@ -265,66 +262,96 @@ if not today_games:
     st.warning("No probable games found for today.")
 
 else:
-    games_per_row = 6
+    games_per_page = 6
     times_df = get_game_start_times()
 
-    for start in range(0, len(today_games), games_per_row):
-        row_games = today_games[start:start + games_per_row]
-        game_cols = st.columns(len(row_games))
+    if "games_page" not in st.session_state:
+        st.session_state["games_page"] = 0
 
-        for i, game in enumerate(row_games):
-            game_index = start + i
-            game_key = f"{game['away_team']}@{game['home_team']}"
+    total_pages = max(1, (len(today_games) + games_per_page - 1) // games_per_page)
 
-            away_selected = (
-                st.session_state.get("selected_game_key") == game_key
-                and st.session_state.get("selected_batting_side") == "away"
-            )
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 3, 1])
 
-            home_selected = (
-                st.session_state.get("selected_game_key") == game_key
-                and st.session_state.get("selected_batting_side") == "home"
-            )
+    with nav_col1:
+        if st.button("← Previous", disabled=st.session_state["games_page"] == 0):
+            st.session_state["games_page"] -= 1
+            st.rerun()
 
-            with game_cols[i]:
-                with st.container(border=True):
-                    st.markdown(
-                        f"""
-                        <div class="game-card-title">{times_df["start_time"][i]} - {times_df["status"][i]}</div>
+    with nav_col2:
+        st.markdown(
+            f"<div style='text-align:center; font-weight:700;'>"
+            f"Games {st.session_state['games_page'] + 1} of {total_pages}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-                        <div class="game-team-row">
-                            <span>{game.get("away_abbr", game["away_team"][:3].upper())}</span>
-                            <span>{"Viewing" if away_selected else ""}</span>
-                        </div>
+    with nav_col3:
+        if st.button(
+            "Next →",
+            disabled=st.session_state["games_page"] >= total_pages - 1,
+        ):
+            st.session_state["games_page"] += 1
+            st.rerun()
 
-                        <div class="game-team-row">
-                            <span>{game.get("home_abbr", game["home_team"][:3].upper())}</span>
-                            <span>{"Viewing" if home_selected else ""}</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+    start = st.session_state["games_page"] * games_per_page
+    end = start + games_per_page
+    row_games = today_games[start:end]
 
-                    away_disabled = game["home_pitcher_id"] is None
-                    home_disabled = game["away_pitcher_id"] is None
+    game_cols = st.columns(games_per_page)
 
-                    if st.button(
-                        f"{game.get('away_abbr', game['away_team'][:3].upper())} batting",
-                        key=f"select_away_batting_{game_index}",
-                        use_container_width=True,
-                        disabled=away_disabled,
-                    ):
-                        select_probable_matchup(game, "away")
-                        st.rerun()
+    for i, game in enumerate(row_games):
+        game_index = start + i
+        game_key = f"{game['away_team']}@{game['home_team']}"
 
-                    if st.button(
-                        f"{game.get('home_abbr', game['home_team'][:3].upper())} batting",
-                        key=f"select_home_batting_{game_index}",
-                        use_container_width=True,
-                        disabled=home_disabled,
-                    ):
-                        select_probable_matchup(game, "home")
-                        st.rerun()
+        away_selected = (
+            st.session_state.get("selected_game_key") == game_key
+            and st.session_state.get("selected_batting_side") == "away"
+        )
+
+        home_selected = (
+            st.session_state.get("selected_game_key") == game_key
+            and st.session_state.get("selected_batting_side") == "home"
+        )
+
+        with game_cols[i]:
+            with st.container(border=True):
+
+                st.markdown(
+                    f"""
+                    <div class="game-card-title">{times_df["start_time"][i+start]} - {times_df["status"][i+start]}</div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                away_disabled = game["home_pitcher_id"] is None
+                home_disabled = game["away_pitcher_id"] is None
+
+                away_label = f"{game.get('away_abbr', game['away_team'][:3].upper())} batting"
+                home_label = f"{game.get('home_abbr', game['home_team'][:3].upper())} batting"
+
+                if away_selected:
+                    st.markdown("<div class='game-selected'>Selected</div>", unsafe_allow_html=True)
+
+                if st.button(
+                    away_label,
+                    key=f"select_away_batting_{game_index}",
+                    width="stretch",
+                    disabled=away_disabled,
+                ):
+                    select_probable_matchup(game, "away")
+                    st.rerun()
+
+                if home_selected:
+                    st.markdown("<div class='game-selected'>Selected</div>", unsafe_allow_html=True)
+
+                if st.button(
+                    home_label,
+                    key=f"select_home_batting_{game_index}",
+                    width="stretch",
+                    disabled=home_disabled,
+                ):
+                    select_probable_matchup(game, "home")
+                    st.rerun()
 
 team2_name = st.session_state.get("team2_name")
 team2_id = st.session_state.get("team2_id")
@@ -516,14 +543,14 @@ if st.session_state.get("show_payout"):
                 "Net After Day",
             ]]
 
-            st.line_chart(chart_df, use_container_width=True)
+            st.line_chart(chart_df, width="stretch")
 
             table_df = daily_profit.copy()
             table_df["Date"] = table_df["Date"].dt.strftime("%Y-%m-%d")
 
             st.dataframe(
                 table_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -554,7 +581,7 @@ if st.session_state.get("show_history"):
 
         st.dataframe(
             history_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -658,7 +685,7 @@ if "matchup_df" in st.session_state:
 
     table_event = st.dataframe(
         display_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
@@ -709,7 +736,7 @@ if "matchup_df" in st.session_state:
 
             st.dataframe(
                 hitter_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -719,7 +746,7 @@ if "matchup_df" in st.session_state:
 
             st.dataframe(
                 pitcher_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -743,7 +770,7 @@ if st.session_state.get("show_history", False):
         if history_rows:
             st.dataframe(
                 pd.DataFrame(history_rows),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -815,7 +842,7 @@ if st.session_state.get("show_create_line_form"):
                     if st.button(
                         f"{line_label}\n{odds}",
                         key=f"select_line_{line_label}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         st.session_state["selected_bet_label"] = line_label
                         st.session_state["selected_bet_line"] = line_values[line_label]

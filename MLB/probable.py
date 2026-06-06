@@ -7,11 +7,18 @@ import pandas as pd
 import requests
 import logging
 
-import calc
+import MLB.calc as calc
 
 
 CACHE_DIR = "data/matchup_cache"
 logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+
+TEAM_NAME_ALIASES = {
+    "Athletics": "Oakland Athletics",
+}
+
+def normalize_team_name(team_name):
+    return TEAM_NAME_ALIASES.get(team_name, team_name)
 
 @contextlib.contextmanager
 def suppress_terminal_output():
@@ -48,30 +55,25 @@ def get_today_probable_games():
             away = game["teams"]["away"]
             home = game["teams"]["home"]
 
-            # away_team = away["team"]["name"]
-            # home_team = home["team"]["name"]
+            away_team = normalize_team_name(away["team"]["name"])
+            home_team = normalize_team_name(home["team"]["name"])
 
             away_pitcher = away.get("probablePitcher")
             home_pitcher = home.get("probablePitcher")
 
-            away_team_obj = away["team"]
-            home_team_obj = home["team"]
-
             games.append({
-                "away_team": away_team_obj["name"],
-                "away_team_id": away_team_obj["id"],
-                "away_abbr": away_team_obj.get("abbreviation", away_team_obj["name"][:3].upper()),
+            "away_team": away_team,
+            "away_team_id": away["team"]["id"],
 
-                "home_team": home_team_obj["name"],
-                "home_team_id": home_team_obj["id"],
-                "home_abbr": home_team_obj.get("abbreviation", home_team_obj["name"][:3].upper()),
+            "home_team": home_team,
+            "home_team_id": home["team"]["id"],
 
-                "away_pitcher_name": away_pitcher.get("fullName") if away_pitcher else None,
-                "away_pitcher_id": away_pitcher.get("id") if away_pitcher else None,
+            "away_pitcher_name": away_pitcher.get("fullName") if away_pitcher else None,
+            "away_pitcher_id": away_pitcher.get("id") if away_pitcher else None,
 
-                "home_pitcher_name": home_pitcher.get("fullName") if home_pitcher else None,
-                "home_pitcher_id": home_pitcher.get("id") if home_pitcher else None,
-            })
+            "home_pitcher_name": home_pitcher.get("fullName") if home_pitcher else None,
+            "home_pitcher_id": home_pitcher.get("id") if home_pitcher else None,
+        })
 
     return games
 
@@ -84,6 +86,33 @@ def safe_filename(text):
         .replace("\\", "_")
         .replace(":", "")
     )
+
+
+def get_matchup_cache_path(today, hitter_team_name, pitcher_name):
+    """Return the exact CSV path used for one precomputed matchup."""
+    filename = (
+        f"{today}__{safe_filename(hitter_team_name)}_hitters_vs_"
+        f"{safe_filename(pitcher_name)}.csv"
+    )
+    return os.path.join(CACHE_DIR, filename)
+
+
+def cache_file_is_usable(path):
+    """
+    True only when the CSV already exists, is not empty,
+    and can be opened by pandas.
+    """
+    if not os.path.exists(path):
+        return False
+
+    if os.path.getsize(path) == 0:
+        return False
+
+    try:
+        pd.read_csv(path, nrows=1)
+        return True
+    except Exception:
+        return False
 
 
 def build_matchup_table(pitcher_id, pitcher_name, hitter_team_name): 
@@ -130,7 +159,7 @@ def build_matchup_table(pitcher_id, pitcher_name, hitter_team_name):
 
         print(
             f"\rProgress: {percent}% "
-            f"({i}/{total_hitters}) - {hitter_name}",
+            f"({i}/{total_hitters}) - {hitter_name} - {str(datetime.now())[11:16]}",
             end="",
             flush=True,
         )
@@ -182,6 +211,7 @@ def precompute_today_matchups():
     games = get_today_probable_games()
 
     saved_files = []
+    skipped_existing_files = []
 
     matchups = []
 
@@ -214,6 +244,7 @@ def precompute_today_matchups():
         hitter_team_name = matchup["hitter_team_name"]
 
         overall_percent = round(matchup_index / total_matchups * 100, 1)
+        path = get_matchup_cache_path(today, hitter_team_name, pitcher_name)
 
         print("\n" + "=" * 60)
         print(
@@ -223,6 +254,11 @@ def precompute_today_matchups():
         print(f"Matchup: {hitter_team_name} hitters vs {pitcher_name}")
         print("=" * 60)
 
+        if cache_file_is_usable(path):
+            skipped_existing_files.append(path)
+            print(f"Already exists, skipping: {path}")
+            continue
+
         df = build_matchup_table(
             pitcher_id=pitcher_id,
             pitcher_name=pitcher_name,
@@ -230,13 +266,9 @@ def precompute_today_matchups():
         )
 
         if df is not None:
-            filename = (
-                f"{today}__{safe_filename(hitter_team_name)}_hitters_vs_"
-                f"{safe_filename(pitcher_name)}.csv"
-            )
-
-            path = os.path.join(CACHE_DIR, filename)
-            df.to_csv(path, index=False)
+            temp_path = f"{path}.tmp"
+            df.to_csv(temp_path, index=False)
+            os.replace(temp_path, path)
             saved_files.append(path)
 
             print(f"Saved: {path}")
@@ -244,10 +276,18 @@ def precompute_today_matchups():
             print(f"Skipped: {hitter_team_name} hitters vs {pitcher_name}")
 
     print("\nDone.")
-    print(f"Saved {len(saved_files)} matchup files.")
+    print(f"Saved {len(saved_files)} new matchup files.")
+    print(f"Skipped {len(skipped_existing_files)} existing matchup files.")
 
-    for path in saved_files:
-        print(path)
+    if saved_files:
+        print("\nNew files:")
+        for path in saved_files:
+            print(path)
+
+    if skipped_existing_files:
+        print("\nExisting files skipped:")
+        for path in skipped_existing_files:
+            print(path)
 
 
 if __name__ == "__main__":
