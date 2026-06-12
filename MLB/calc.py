@@ -472,10 +472,20 @@ def get_pitcher_k_rate(pitcher_id):
         f"?stats=season&season={current_year}&group=pitching"
     )
 
-    response = requests.get(url, timeout=20)
-    data = response.json()
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
 
-    splits = data.get("stats", [{}])[0].get("splits", [])
+    stats_list = data.get("stats", [])
+
+    # This happens for debut pitchers / pitchers with no MLB season stats yet.
+    if not stats_list:
+        return None
+
+    splits = stats_list[0].get("splits", [])
 
     if not splits:
         return None
