@@ -10,7 +10,8 @@ import logging
 import MLB.calc as calc
 
 
-CACHE_DIR = "data/matchup_cache"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR = os.path.join(BASE_DIR, "data", "matchup_cache")
 logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
 
 TEAM_NAME_ALIASES = {
@@ -291,4 +292,5 @@ def precompute_today_matchups():
 
 
 if __name__ == "__main__":
+    
     precompute_today_matchups()
